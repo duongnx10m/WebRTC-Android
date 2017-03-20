@@ -1,1 +1,1 @@
-include ':app', ':webrtc-client'
+include ':app', ':webrtc-client', ':libjinglepeerconnection'

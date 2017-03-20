@@ -1,23 +1,38 @@
 package fr.pchab.webrtcclient;
 
-import java.net.URISyntaxException;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import android.util.Log;
 
+import com.github.nkzawa.emitter.Emitter;
 import com.github.nkzawa.socketio.client.IO;
 import com.github.nkzawa.socketio.client.Socket;
-import com.github.nkzawa.emitter.Emitter;
 
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.webrtc.AudioSource;
+import org.webrtc.Camera1Enumerator;
+import org.webrtc.CameraEnumerationAndroid;
+import org.webrtc.CameraEnumerator;
+import org.webrtc.CameraVideoCapturer;
+import org.webrtc.DataChannel;
+import org.webrtc.EglBase;
+import org.webrtc.IceCandidate;
+import org.webrtc.Logging;
+import org.webrtc.MediaConstraints;
+import org.webrtc.MediaStream;
+import org.webrtc.PeerConnection;
+import org.webrtc.PeerConnectionFactory;
+import org.webrtc.RtpReceiver;
+import org.webrtc.SdpObserver;
+import org.webrtc.SessionDescription;
+import org.webrtc.VideoCapturer;
+import org.webrtc.VideoCapturerAndroid;
+import org.webrtc.VideoSource;
 
-import android.opengl.EGLContext;
-import android.util.Log;
-
-import org.webrtc.*;
+import java.net.URISyntaxException;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 
 public class WebRtcClient {
     private final static String TAG = "duongnx";
@@ -32,6 +47,8 @@ public class WebRtcClient {
     private VideoSource videoSource;
     private RtcListener mListener;
     private Socket client;
+    private VideoCapturer videoCapturer;
+    private final ScheduledExecutorService executor;
 
     /**
      * Implement this interface to be notified of events.
@@ -244,6 +261,11 @@ public class WebRtcClient {
         }
 
         @Override
+        public void onIceCandidatesRemoved(IceCandidate[] iceCandidates) {
+            Log.d(TAG, "PeerConnection.Observer onIceCandidatesRemoved:");
+        }
+
+        @Override
         public void onAddStream(MediaStream mediaStream) {
             Log.d(TAG, "PeerConnection.Observer onAddStream:" + mediaStream.label());
             // remote streams are displayed from 1 to MAX_PEER (0 is localStream)
@@ -264,6 +286,11 @@ public class WebRtcClient {
         @Override
         public void onRenegotiationNeeded() {
             Log.d(TAG, "PeerConnection.Observer onRenegotiationNeeded:");
+        }
+
+        @Override
+        public void onAddTrack(RtpReceiver rtpReceiver, MediaStream[] mediaStreams) {
+            Log.d(TAG, "PeerConnection.Observer onAddTrack:");
         }
 
         public Peer(String id, int endPoint) {
@@ -298,11 +325,12 @@ public class WebRtcClient {
 
     public WebRtcClient(RtcListener listener, String host, PeerConnectionParameters params, EglBase.Context mEGLcontext) {
         Log.d(TAG, "WebRtcClient host:" + host + " connect to socket");
+        executor = Executors.newSingleThreadScheduledExecutor();
         mListener = listener;
         pcParams = params;
         PeerConnectionFactory.initializeAndroidGlobals(listener, true, true,
                 params.videoCodecHwAcceleration);
-        factory = new PeerConnectionFactory();
+        factory = new PeerConnectionFactory(null);
         MessageHandler messageHandler = new MessageHandler();
 
         try {
@@ -327,14 +355,14 @@ public class WebRtcClient {
      * Call this method in Activity.onPause()
      */
     public void onPause() {
-        if (videoSource != null) videoSource.stop();
+        //if (videoSource != null) videoSource.stop();
     }
 
     /**
      * Call this method in Activity.onResume()
      */
     public void onResume() {
-        if (videoSource != null) videoSource.restart();
+        //if (videoSource != null) videoSource.restart();
     }
 
     /**
@@ -342,13 +370,33 @@ public class WebRtcClient {
      */
     public void onDestroy() {
         for (Peer peer : peers.values()) {
-            //peer.pc.dispose();
+            if (peer.pc != null) {
+                peer.pc.dispose();
+                peer.pc = null;
+            }
         }
-        if (videoSource != null)
-            videoSource.stop();
-        factory.dispose();
-        client.disconnect();
-        client.close();
+        if (videoCapturer != null) {
+            try {
+                videoCapturer.stopCapture();
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+            videoCapturer.dispose();
+            videoCapturer = null;
+        }
+
+//        PeerConnectionFactory.stopInternalTracingCapture();
+//        PeerConnectionFactory.shutdownInternalTracer();
+        if (factory != null) {
+            factory.dispose();
+            factory = null;
+        }
+
+        if (client != null) {
+            client.disconnect();
+            client.close();
+            client = null;
+        }
     }
 
     private int findEndPoint() {
@@ -387,7 +435,9 @@ public class WebRtcClient {
             videoConstraints.mandatory.add(new MediaConstraints.KeyValuePair("maxFrameRate", Integer.toString(pcParams.videoFps)));
             videoConstraints.mandatory.add(new MediaConstraints.KeyValuePair("minFrameRate", Integer.toString(pcParams.videoFps)));
 
-            videoSource = factory.createVideoSource(getVideoCapturer(), videoConstraints);
+            videoCapturer = getVideoCapturer();
+            videoSource = factory.createVideoSource(videoCapturer);
+            videoCapturer.startCapture(pcParams.videoWidth, pcParams.videoHeight, pcParams.videoFps);
             localMS.addTrack(factory.createVideoTrack("ARDAMSv0", videoSource));
         }
 
@@ -398,14 +448,74 @@ public class WebRtcClient {
         mListener.onLocalStream(localMS);
     }
 
-    private VideoCapturer getVideoCapturer() {
-        String cameraDeviceName = CameraEnumerationAndroid.getDeviceName(0);
-        String frontCameraDeviceName = CameraEnumerationAndroid.getNameOfFrontFacingDevice();
-        int numberOfCameras = CameraEnumerationAndroid.getDeviceCount();
-        if (numberOfCameras > 1 && frontCameraDeviceName != null)
-            cameraDeviceName = frontCameraDeviceName;
-        Log.d(TAG, "getVideoCapturer:" + cameraDeviceName);
-        return VideoCapturerAndroid.create(cameraDeviceName);
+    private void switchCameraInternal() {
+        if (videoCapturer != null && videoCapturer instanceof CameraVideoCapturer) {
+//            if (!videoCallEnabled || isError || videoCapturer == null) {
+//                Log.e(TAG, "Failed to switch camera. Video: " + videoCallEnabled + ". Error : " + isError);
+//                return; // No video is sent or only one camera is available or error happened.
+//            }
+            Log.d(TAG, "Switch camera");
+            CameraVideoCapturer cameraVideoCapturer = (CameraVideoCapturer) videoCapturer;
+            cameraVideoCapturer.switchCamera(null);
+        } else {
+            Log.d(TAG, "Will not switch camera, video caputurer is not a camera");
+        }
     }
+
+    public void switchCamera() {
+        executor.execute(new Runnable() {
+            @Override
+            public void run() {
+                switchCameraInternal();
+            }
+        });
+    }
+
+    private VideoCapturer getVideoCapturer() {
+        VideoCapturer videoCapturer = null;
+        Logging.d(TAG, "Creating capturer using camera1 API.");
+        videoCapturer = createCameraCapturer(new Camera1Enumerator(false));
+
+        if (videoCapturer == null) {
+
+            return null;
+        }
+        return videoCapturer;
+    }
+
+    private VideoCapturer createCameraCapturer(CameraEnumerator enumerator) {
+        final String[] deviceNames = enumerator.getDeviceNames();
+
+        // First, try to find front facing camera
+        //Logging.d(TAG, "Looking for front facing cameras.");
+        for (String deviceName : deviceNames) {
+            if (enumerator.isFrontFacing(deviceName)) {
+                Logging.d(TAG, "Creating front facing camera capturer.");
+                VideoCapturer videoCapturer = enumerator.createCapturer(deviceName, null);
+
+                if (videoCapturer != null) {
+                    Log.d(TAG, "videoCapturer:" + videoCapturer.toString());
+                    return videoCapturer;
+                }
+            }
+        }
+
+        // Front facing camera not found, try something else
+        //Logging.d(TAG, "Looking for other cameras.");
+        for (String deviceName : deviceNames) {
+            if (!enumerator.isFrontFacing(deviceName)) {
+                Logging.d(TAG, "Creating other camera capturer.");
+                VideoCapturer videoCapturer = enumerator.createCapturer(deviceName, null);
+
+                if (videoCapturer != null) {
+                    Log.d(TAG, "videoCapturer:" + videoCapturer.toString());
+                    return videoCapturer;
+                }
+            }
+        }
+
+        return null;
+    }
+
 
 }

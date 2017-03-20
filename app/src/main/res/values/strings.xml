@@ -8,4 +8,9 @@
     <string name="port">3000</string>
     <!--<string name="port">443</string>-->
     <string name="action_settings">Options</string>
+
+    <string name="toggle_mic">Toggle microphone on/off</string>
+    <string name="capture_format_change_text">Slide to change capture format</string>
+    <string name="disconnect_call">Disconnect Call</string>
+    <string name="switch_camera">Switch front/back camera</string>
 </resources>
